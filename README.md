@@ -9,7 +9,7 @@
 ![Labels](https://img.shields.io/badge/Labels-6_Jigsaw-1F3864?style=for-the-badge)
 ![Rewriters](https://img.shields.io/badge/Rewriters-rules_LLM_HF-2E5FD9?style=for-the-badge)
 ![CLI commands](https://img.shields.io/badge/CLI_commands-6-6E86E8?style=for-the-badge)
-![Tests](https://img.shields.io/badge/Tests-30_passing-3DA35B?style=for-the-badge)
+![Tests](https://img.shields.io/badge/Tests-28_passing-3DA35B?style=for-the-badge)
 ![Offline demo](https://img.shields.io/badge/Offline_demo-Yes-F5C542?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-A0399B?style=for-the-badge)
 
@@ -111,7 +111,7 @@ kindify gives each of these questions its own component. Each component has a sm
 | Rewriters | Rules (core), any OpenAI-compatible chat server, a local HF chat model (extra `transformers`) |
 | Offline mode | Training, evaluation, moderation and rewrite evaluation with the TF-IDF classifier and the rule rewriter |
 | Safety | Five guards on each rewrite, a time limit with a fallback, opt-in feedback with redaction and retention |
-| Tests | **30** pass locally and 1 skips without `fastapi`. In CI, **28** pass and 3 skip (`pytest`) |
+| Tests | **28** unit tests pass in CI (`pytest`), 3 skip without the extras. With the extras, 31 pass |
 
 ```mermaid
 flowchart LR
@@ -462,9 +462,8 @@ Planned milestones (not built): a transformer training command, a fluency score 
 
 | Validation | Result | Command |
 |---|---|---|
-| Unit tests (local) | **30 passed, 1 skipped** (`fastapi` not installed). The transformer tests use a tiny local model | `pytest -q` |
-| Unit tests with `fastapi` | 31 passed | `pytest -q` |
-| Expected CI | 28 passed, 3 skipped (no torch, transformers or fastapi) | `.github/workflows/ci.yml` |
+| Unit tests (CI installs only `.[dev]`) | **28 passed**, 3 skipped (`torch`, `transformers` and `fastapi` absent) | `pytest -q` |
+| Unit tests with the extras `transformers` and `api` | **31 passed**. The transformer tests use a tiny model that the tests make | `pip install -e ".[dev,transformers,api]"`, `pytest -q` |
 | Synthetic classifier, `toxic`, test part (1,200 comments, 13.9 % toxic) | ROC-AUC 0.959, PR-AUC 0.931, threshold 0.42, precision 0.974, recall 0.892, F1 0.931 | `kindify train` |
 | Synthetic bias | BPSN AUC 0.923 for `man` and 0.928 for `white`. Final bias score 0.981 | `kindify train` |
 | Synthetic rule rewrites (200 toxic comments) | STA 0.815, SIM 0.645, J (STA × SIM) 0.542, prompt echo 0.0 | `kindify rewrite-eval` |
