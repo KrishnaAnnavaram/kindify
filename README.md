@@ -74,6 +74,7 @@ This README is the **one location that explains all of kindify**. It gives these
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one comment](#42-the-life-cycle-of-one-comment)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [The classifiers and their evaluation](#5-the-classifiers-and-their-evaluation)
 6. 🟢 [The rewriters and the guards](#6-the-rewriters-and-the-guards)
 7. 🟣 [The service, the API and the feedback store](#7-the-service-the-api-and-the-feedback-store)
@@ -143,6 +144,52 @@ flowchart LR
 | Experiment | `src/kindify/experiment.py` | Train, evaluate, rewrite evaluation, model card |
 | CLI | `src/kindify/cli.py` | The `kindify` command with 6 subcommands |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry points"]
+        CLI["cli.py<br/>kindify command"]
+        API["api.py<br/>FastAPI app, api extra"]
+    end
+    CFG["config.py<br/>Settings, load_env_file"]
+    subgraph TRAINEVAL["Train and evaluate"]
+        EXP["experiment.py<br/>train, evaluate, evaluate_rewrites"]
+        DATA["data.py<br/>load_jigsaw, split, synthetic_comments"]
+        CLF["classifier.py<br/>TfidfClassifier, logits_to_proba"]
+        TRF["transformer_model.py<br/>TransformerClassifier, extra"]
+        EVA["evaluate.py<br/>best_threshold, bias_table"]
+        DET["detox_eval.py<br/>detox_metrics"]
+    end
+    subgraph MODERATE["Moderate"]
+        SVC["service.py<br/>ModerationService"]
+        RW["rewrite/rewriters.py<br/>rules, OpenAI-compatible, HF"]
+        PR["rewrite/prompts.py<br/>build_messages"]
+        GD["rewrite/guards.py<br/>check_rewrite"]
+        FB["feedback.py<br/>FeedbackStore"]
+    end
+
+    CLI --> CFG
+    CLI --> DATA
+    CLI --> EXP
+    CLI --> SVC
+    CLI --> FB
+    API --> CFG
+    API --> SVC
+    API --> FB
+    EXP --> DATA
+    EXP --> CLF
+    EXP --> EVA
+    EXP --> DET
+    EVA --> DATA
+    TRF --> CLF
+    DET --> GD
+    SVC --> RW
+    SVC --> GD
+    RW --> PR
+    GD --> PR
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -190,7 +237,23 @@ kindify/
 The OpenAI-compatible rewriter reads only the reply message. The HF rewriter decodes only the new tokens. The guards refuse a rewrite that repeats the system prompt or a few-shot example.
 
 ### 3.5 Never cut the comment
-`build_messages` drops few-shot examples first. If the comment alone is too long, it raises `CommentTooLong`, and the service gives no rewrite.
+`build_messages` drops few-shot examples first. If the comment alone is too long, it raises `CommentTooLong`, and the service gives no LLM rewrite. The rule rewriter then tries.
+
+```mermaid
+flowchart TD
+    IN[/"comment"/] --> E{"empty after strip?"}
+    E -- "yes" --> ERR[/"ValueError"/]
+    E -- "no" --> BASE["base: system prompt + comment"]
+    BASE --> FIT{"base above<br/>4,000 characters?"}
+    FIT -- "yes" --> LONG[/"CommentTooLong<br/>no LLM rewrite, the rule rewriter tries"/]
+    FIT -- "no" --> EX["next few-shot pair"]
+    EX --> ROOM{"pair fits in<br/>the budget?"}
+    ROOM -- "yes" --> ADD["add the pair"]
+    ADD --> MORE{"more pairs?"}
+    MORE -- "yes" --> EX
+    ROOM -- "no" --> OUT
+    MORE -- "no" --> OUT[/"system, examples,<br/>comment as the last user turn"/]
+```
 
 ### 3.6 Load late and limit time
 The service loads the classifier on the first request. Each rewrite has a time limit (`KINDIFY_TIMEOUT_S`). After a timeout, the service uses the rule rewriter.
@@ -220,24 +283,64 @@ The store refuses a row without consent. It redacts personal data and deletes ro
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    C["Comment"] --> L["load the classifier on first use"]
+flowchart TD
+    TR["kindify train: split, fit,<br/>best_threshold, evaluate"] --> RUN[("run folder<br/>classifier.joblib, metrics.json, model_card.md")]
+    C[/"Comment"/] --> L["load the classifier on first use"]
+    RUN --> L
     L --> P["predict_proba: 6 label scores"]
     P --> T{"toxic >= threshold?"}
-    T -- "no" --> R0["return scores"]
-    T -- "yes" --> M["build_messages: system, examples, comment"]
+    T -- "no" --> R0[/"return scores"/]
+    T -- "yes" --> M["build_messages: system, examples, comment<br/>LLM rewriters only"]
     M --> RW["rewriter with a time limit"]
     RW -- "error or timeout" --> FB["rule rewriter"]
-    RW --> G["guards: echo, toxicity, similarity, length"]
+    RW --> G{"guards: echo, toxicity,<br/>similarity, length"}
     FB --> G
-    G -- "pass" --> R1["return the rewrite"]
+    G -- "pass" --> R1[/"return the rewrite"/]
     G -- "fail" --> NEXT{"fallback left?"}
     NEXT -- "yes" --> FB
-    NEXT -- "no" --> R2["return no rewrite, with notes"]
-    R1 --> F["optional opt-in feedback"]
+    NEXT -- "no" --> R2[/"return no rewrite, with notes"/]
+    R1 --> HUMAN{{"HUMAN<br/>moderator reviews the comment<br/>and the rewrite"}}
+    R2 --> HUMAN
+    R1 --> F{"user gives consent?"}
+    F -- "yes" --> DB[("feedback/kindify.sqlite<br/>redacted rating")]
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one comment
+
+```mermaid
+stateDiagram-v2
+    state "Comment received" as Received
+    state "Scored, 6 labels" as Scored
+    state "Not toxic" as NotToxic
+    state "Configured rewriter" as First
+    state "Rule rewriter fallback" as Fallback
+    state "Guard check" as Checked
+    state "Rewrite returned" as Rewritten
+    state "No rewrite, notes" as NoRewrite
+    state "Moderator review" as Review
+    state "Feedback stored" as Stored
+    [*] --> Received: moderate(comment)
+    Received --> Scored: predict_proba
+    Scored --> NotToxic: toxic score below the threshold
+    Scored --> First: toxic score at or above the threshold
+    First --> Checked: text within the time limit
+    First --> Fallback: timeout, RewriteError or CommentTooLong
+    First --> NoRewrite: rules rewriter failed
+    Fallback --> Checked: text within the time limit
+    Fallback --> NoRewrite: timeout or RewriteError
+    Checked --> Rewritten: all guards pass
+    Checked --> Fallback: guard failed, rule rewriter not tried
+    Checked --> NoRewrite: guard failed, no rewriter left
+    NotToxic --> [*]
+    Rewritten --> Review
+    NoRewrite --> Review
+    Review --> Stored: user gives consent, redacted
+    Review --> [*]
+    Stored --> [*]: purge after KINDIFY_RETENTION_DAYS
+```
 
 1. The client sends the comment to `ModerationService.moderate`.
 2. The service loads the run folder if this is the first request.
@@ -248,11 +351,82 @@ flowchart TB
 7. The service returns the first rewrite that passes, or no rewrite and the reasons.
 8. If the user gives consent, the client stores a rating or a preference pair.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor M as Moderator or client app
+    participant API as FastAPI app
+    participant SVC as ModerationService
+    participant RUN as Run folder
+    participant CLF as TfidfClassifier
+    participant RW as Rewriter
+    participant LLM as Chat server, optional
+    participant GD as Guards
+    participant FB as FeedbackStore
+
+    M->>API: POST /moderate with comment
+    API->>SVC: moderate(comment)
+    SVC->>RUN: load_classifier on first use
+    RUN-->>SVC: classifier and threshold
+    SVC->>CLF: predict_proba(comment)
+    CLF-->>SVC: 6 label scores
+    SVC->>RW: rewrite(comment) in a worker thread, with the time limit
+    RW->>LLM: POST /chat/completions with build_messages
+    LLM-->>RW: reply message only
+    RW-->>SVC: rewrite text
+    SVC->>GD: check_rewrite(comment, text, toxicity, threshold)
+    GD->>CLF: re-classify the rewrite
+    GD-->>SVC: GuardResult
+    SVC-->>API: ModerationResult
+    API-->>M: scores, toxic, rewrite, guard, notes
+    M->>API: POST /feedback with rating and consent
+    API->>FB: add_rating, redact
+    FB-->>API: stored true or false
+    API-->>M: stored
+```
+
 ---
 
 ## 5. The classifiers and their evaluation
 
 **Purpose.** Score each label with a probability, and measure the classifier honestly.
+
+```mermaid
+flowchart TD
+    SRC{"--data or KINDIFY_DATA?"} -- "yes" --> LJ["load_jigsaw<br/>official test rows with -1 dropped"]
+    SRC -- "no" --> SY["synthetic_comments<br/>--rows, seed"]
+    LJ --> V["validate: comment_text,<br/>labels 0 or 1"]
+    SY --> V
+    V --> T{"official test set?"}
+    T -- "no" --> S3["split 70/15/15<br/>stratified on toxic"]
+    T -- "yes" --> S2["split train and val only"]
+    S3 --> FIT["TfidfClassifier.fit<br/>word + char TF-IDF, one logistic regression for each label"]
+    S2 --> FIT
+    FIT --> THR["best_threshold on val"]
+    THR --> EV["evaluate on test"]
+    EV --> TRUNC["truncation_report"]
+    TRUNC --> OUT[("run folder: classifier.joblib,<br/>metrics.json, model_card.md")]
+```
+
+```mermaid
+flowchart LR
+    TE[/"test part"/] --> PP["predict_proba"]
+    PP --> PL["per_label<br/>ROC-AUC, PR-AUC"]
+    PP --> AT["at_threshold<br/>precision, recall, F1, flagged share"]
+    PP --> IM["identity_mentions<br/>8 terms"]
+    IM --> BT{"10 or more<br/>comments with the term?"}
+    BT -- "yes" --> ROW["subgroup, BPSN and BNSP AUC"]
+    BT -- "no" --> SKIP["no row"]
+    ROW --> FBS["final_bias_score<br/>0.25 overall + 0.75 power means"]
+    PL --> FBS
+    PP --> LANG["by_language<br/>if a lang column exists"]
+    PL --> OUT[/"summary in metrics.json"/]
+    AT --> OUT
+    FBS --> OUT
+    LANG --> OUT
+```
 
 | Classifier | Features and model | Notes |
 |---|---|---|
@@ -279,6 +453,36 @@ flowchart TB
 
 **Purpose.** Make a polite version of a toxic comment, and show it only if it passes all guards.
 
+```mermaid
+flowchart TD
+    C[/"comment"/] --> K{"KINDIFY_REWRITER"}
+    K -- "rules" --> RR["RuleRewriter<br/>ordered regex rules, then tidy"]
+    K -- "openai" --> BM1["build_messages"]
+    K -- "hf" --> BM2["build_messages"]
+    BM1 --> OA["POST base_url/chat/completions<br/>temperature 0.2"]
+    OA --> RO["read only the reply message"]
+    BM2 --> HF["apply_chat_template,<br/>greedy, 120 new tokens"]
+    HF --> NT["decode_new_tokens"]
+    RR --> E{"text left?"}
+    RO --> E
+    NT --> E
+    E -- "no" --> ERR[/"RewriteError"/]
+    E -- "yes" --> OUT[/"rewrite text"/]
+```
+
+```mermaid
+flowchart TD
+    IN[/"comment, rewrite, threshold"/] --> EMP{"rewrite empty?"}
+    EMP -- "yes" --> FAIL1[/"fail: empty rewrite"/]
+    EMP -- "no" --> G1["echoes_prompt<br/>40-character piece of the prompt or an example"]
+    G1 --> G2["re-classify: toxic score<br/>below the threshold"]
+    G2 --> G3["similarity: char 3-5 gram<br/>cosine of 0.2 or more"]
+    G3 --> G4["length ratio 0.3 to 3.0"]
+    G4 --> R{"any reason recorded?"}
+    R -- "yes" --> FAIL2[/"GuardResult passed false,<br/>with the reasons"/]
+    R -- "no" --> PASS[/"GuardResult passed true"/]
+```
+
 | Rewriter | How it works |
 |---|---|
 | `RuleRewriter` | Ordered regular-expression rules: insults to "I disagree with you", "shut up" to "please let me finish", threats to "please discuss it on the talk page first", profanity removed |
@@ -304,7 +508,41 @@ flowchart TB
 
 **Service.** `ModerationService(loader, rewriter, threshold, timeout_s)` returns a `ModerationResult`: `comment`, `scores`, `toxic`, `threshold`, `rewrite`, `rewriter`, `guard` and `notes`.
 
+```mermaid
+flowchart TD
+    C[/"comment"/] --> B["bundle: loader on first use"]
+    B --> S["predict_proba, round to 4 places"]
+    S --> T{"toxic score at or<br/>above the threshold?"}
+    T -- "no" --> R0[/"ModerationResult, scores only"/]
+    T -- "yes" --> CAND{"configured rewriter is rules?"}
+    CAND -- "yes" --> L1["candidates: rules"]
+    CAND -- "no" --> L2["candidates: configured, then rules"]
+    L1 --> TRY["run the candidate in a worker thread<br/>KINDIFY_TIMEOUT_S"]
+    L2 --> TRY
+    TRY -- "timeout or error" --> NOTE["add a note"]
+    TRY -- "text" --> GUARD{"check_rewrite passes?"}
+    GUARD -- "yes" --> OK[/"rewrite, rewriter name, guard"/]
+    GUARD -- "no" --> NOTE
+    NOTE --> NEXT{"next candidate?"}
+    NEXT -- "yes" --> TRY
+    NEXT -- "no" --> NONE[/"no rewrite, notes"/]
+```
+
 **API (extra `api`).**
+
+```mermaid
+flowchart LR
+    REQ[/"HTTP request"/] --> R{"endpoint"}
+    R -- "GET /health" --> H[/"status ok"/]
+    R -- "POST /moderate" --> E{"comment empty?"}
+    E -- "yes" --> E422[/"422"/]
+    E -- "no" --> MOD["ModerationService.moderate"]
+    MOD --> J[/"ModerationResult as JSON"/]
+    R -- "POST /feedback" --> FB["FeedbackStore.add_rating"]
+    FB -- "no consent" --> NS[/"stored false"/]
+    FB -- "consent, rating not -1 or 1" --> E422
+    FB -- "consent, valid rating" --> ST[/"stored true"/]
+```
 
 | Endpoint | Body | Result |
 |---|---|---|
@@ -313,6 +551,36 @@ flowchart TB
 | `POST /feedback` | `{"comment", "rewrite", "rating", "consent"}` | `{"stored": true}` only with consent |
 
 **Feedback store.**
+
+```mermaid
+flowchart LR
+    IN[/"comment, rewrite, rating, consent"/] --> C{"consent?"}
+    C -- "no" --> NO[/"not stored"/]
+    C -- "yes" --> RED["redact: e-mail, URL, IP,<br/>phone, handle"]
+    RED --> DB[("kindify.sqlite<br/>ratings, preferences")]
+    DB --> PUR["kindify feedback purge<br/>delete rows older than the retention period"]
+    DB --> EXP["kindify feedback export"]
+    EXP --> PAIRS["preference rows, plus liked and<br/>disliked rewrites of one comment"]
+    PAIRS --> OUT[/"preferences.jsonl<br/>prompt, chosen, rejected"/]
+```
+
+```mermaid
+erDiagram
+    ratings {
+        INTEGER id PK
+        TEXT created
+        TEXT comment
+        TEXT rewrite
+        INTEGER rating
+    }
+    preferences {
+        INTEGER id PK
+        TEXT created
+        TEXT comment
+        TEXT chosen
+        TEXT rejected
+    }
+```
 
 1. Refuse a row without `consent=True`.
 2. Replace e-mail addresses, URLs, IP addresses, phone numbers and @handles with placeholders.
@@ -325,6 +593,18 @@ kindify does not run a preference fine-tune. The export is the input for a later
 ---
 
 ## 8. The decision rules and the metrics
+
+```mermaid
+flowchart LR
+    V[/"validation part:<br/>toxic labels and scores"/] --> G["grid 0.05 to 0.95, step 0.01"]
+    G --> F1["F1 at each threshold"]
+    F1 --> MAX["thresholds with the highest F1"]
+    MAX --> MID["take the middle one"]
+    MID --> T[/"threshold in classifier.joblib"/]
+    T --> DEC{"toxic score >= threshold?"}
+    DEC -- "yes" --> TOX[/"toxic: rewrite"/]
+    DEC -- "no" --> OK[/"not toxic: scores only"/]
+```
 
 | Rule | Value |
 |---|---|
@@ -344,6 +624,24 @@ kindify does not run a preference fine-tune. The export is the input for a later
 | SIM | Mean character n-gram cosine between comment and rewrite |
 | J (STA × SIM) | Mean of STA_i × SIM_i. Fluency is not in J because the core has no language model |
 | Prompt echo share | Share of rewrites that repeat the prompt |
+
+`kindify rewrite-eval` calculates the rewrite metrics. It does not apply the guards.
+
+```mermaid
+flowchart LR
+    D[/"labelled CSV or synthetic rows"/] --> TX["toxic comments,<br/>first --limit rows"]
+    TX --> BEF["toxicity before"]
+    TX --> RW["rewriter.rewrite<br/>a failure keeps the comment"]
+    RW --> AFT["toxicity after"]
+    AFT --> STA["STA: share below the threshold"]
+    RW --> SIM["SIM: char n-gram cosine"]
+    STA --> J["J: mean of STA_i x SIM_i"]
+    SIM --> J
+    RW --> ECHO["prompt echo share,<br/>unchanged share"]
+    J --> OUT[/"rewrite-eval report,<br/>optional rewrite table CSV"/]
+    BEF --> OUT
+    ECHO --> OUT
+```
 
 ---
 
@@ -418,6 +716,25 @@ uvicorn kindify.api:app --port 8000      # needs the api extra
 
 `python -m kindify` is the same as `kindify`. An error prints `error: <message>`, and the exit code is 1.
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    INS["pip install -e .[dev]"] --> SYN["kindify synth"]
+    SYN --> CSV[("data/synthetic_comments.csv")]
+    INS --> TR["kindify train<br/>Jigsaw or synthetic"]
+    TR --> RUN[("runs/latest<br/>classifier.joblib, metrics.json, model_card.md")]
+    CSV --> EV["kindify evaluate"]
+    RUN --> EV
+    RUN --> MOD["kindify moderate"]
+    RUN --> RE["kindify rewrite-eval"]
+    RUN --> API["uvicorn kindify.api:app<br/>api extra"]
+    MOD --> FBA["kindify feedback add --consent"]
+    API --> DB[("feedback/kindify.sqlite")]
+    FBA --> DB
+    DB --> FBE["kindify feedback export, purge, count"]
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
@@ -427,7 +744,7 @@ uvicorn kindify.api:app --port 8000      # needs the api extra
 | `KINDIFY_RUN_DIR` | All model commands | Run folder. Default `runs/latest` |
 | `KINDIFY_SEED` | `train`, `rewrite-eval` | Seed. Default 42 |
 | `KINDIFY_CLASSIFIER` | Settings check | `tfidf` (default) or `transformer` |
-| `KINDIFY_TRANSFORMER_MODEL` | Transformer classifier | Model name or folder. Necessary for `transformer` |
+| `KINDIFY_TRANSFORMER_MODEL` | Settings check | Model name or folder. Necessary for `transformer`. No command loads this model yet |
 | `KINDIFY_MAX_TOKENS` | Truncation report | Token limit. Default 256 |
 | `KINDIFY_REWRITER` | Service | `rules` (default), `openai` or `hf` |
 | `KINDIFY_LLM_BASE_URL` | OpenAI-compatible rewriter | Default `http://localhost:11434/v1` |
@@ -440,6 +757,17 @@ uvicorn kindify.api:app --port 8000      # needs the api extra
 
 The CLI reads `--env-file` (default `.env`) first. A variable that is already set is not replaced.
 Credentials are only in a local `.env` file. Git ignores this file. Do not print or commit credentials.
+
+```mermaid
+flowchart LR
+    ENV[/"--env-file, default .env"/] --> LE["load_env_file<br/>set variables are not replaced"]
+    PENV[/"process environment"/] --> FE["Settings.from_env"]
+    LE --> FE
+    FE --> CHK{"check: classifier, rewriter,<br/>model names, limits"}
+    CHK -- "valid" --> SET[/"Settings"/]
+    CHK -- "not valid" --> ERR[/"error: message, exit code 1"/]
+    SET --> MR["make_rewriter<br/>rules, openai or hf"]
+```
 
 ---
 
